@@ -19,3 +19,7 @@ Thumbs.db
 # Local OpenUtau source and verification logs
 openutau-source/
 *-build.log
+
+# .NET verification/build outputs
+**/bin/
+**/obj/

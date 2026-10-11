@@ -1,0 +1,43 @@
+diff --git a/OpenUtau.Core/DiffSinger/DiffSingerBasePhonemizer.cs b/OpenUtau.Core/DiffSinger/DiffSingerBasePhonemizer.cs
+index 0e7aadd..df4477a 100644
+--- a/OpenUtau.Core/DiffSinger/DiffSingerBasePhonemizer.cs
++++ b/OpenUtau.Core/DiffSinger/DiffSingerBasePhonemizer.cs
+@@ -36,6 +36,38 @@ public abstract class DiffSingerBasePhonemizer : MachineLearningPhonemizer
+         protected virtual string GetDictionaryName()=>"dsdict.yaml";
+         public virtual string GetLangCode()=>String.Empty;//The language code of the language the phonemizer is made for
+ 
++        public override void SetUp(Note[][] groups, UProject project, UTrack track) {
++            base.SetUp(groups, project, track);
++            for (int i = 1; i < groups.Length; i++) {
++                var previous = groups[i - 1][^1];
++                int gap = groups[i][0].position - previous.position - previous.duration;
++                if (gap > 0 && partResult.TryGetValue(groups[i][0].position, out var phones)) {
++                    double previousEndMs = timeAxis.TickPosToMsPos(previous.position + previous.duration);
++                    double previousStartMs = timeAxis.TickPosToMsPos(previous.position);
++                    double overlapMs = Math.Min(70, (previousEndMs - previousStartMs) * 0.3);
++                    int overlapTicks = previous.position + previous.duration
++                        - timeAxis.MsPosToTickPos(previousEndMs - overlapMs);
++                    ConstrainPhraseLeadToRest(phones, gap + Math.Max(0, overlapTicks));
++                }
++            }
++        }
++
++        internal static void ConstrainPhraseLeadToRest(List<Tuple<string, int>> phones, int gap) {
++            if (gap <= 0 || phones.Count == 0) return;
++            int lead = 0;
++            foreach (var phone in phones) lead = Math.Max(lead, -phone.Item2);
++            if (lead <= gap) return;
++            // Keep the vowel anchor and consonant order; only compress the lead
++            // that would otherwise reach too far into the previous note across a rest.
++            double scale = (double)gap / lead;
++            for (int i = 0; i < phones.Count; i++) {
++                if (phones[i].Item2 < 0) {
++                    phones[i] = Tuple.Create(phones[i].Item1,
++                        Math.Max(-gap, (int)Math.Floor(phones[i].Item2 * scale)));
++                }
++            }
++        }
++
+         private bool _singerLoaded;
+ 
+         public override void SetSinger(USinger singer) {

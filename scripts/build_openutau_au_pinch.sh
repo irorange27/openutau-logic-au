@@ -35,6 +35,14 @@ elif ! git -C "$source_dir" apply --reverse --check "$guide_patch" 2>/dev/null; 
     exit 1
 fi
 
+timing_patch="$repo/patches/openutau-diffsinger-phrase-lead-0.1.572.1-alpha.patch"
+if git -C "$source_dir" apply --check "$timing_patch" 2>/dev/null; then
+    git -C "$source_dir" apply "$timing_patch"
+elif ! git -C "$source_dir" apply --reverse --check "$timing_patch" 2>/dev/null; then
+    echo 'Source differs from the expected phrase timing patch state.' >&2
+    exit 1
+fi
+
 (
     cd "$source_dir"
     "$dotnet" build OpenUtau -c Release -r osx-arm64 \
@@ -45,6 +53,10 @@ fi
 ditto "$official_app" "$output_app"
 ditto "$source_dir/OpenUtau/bin/Release/net10.0/osx-arm64/OpenUtau.dll" \
     "$output_app/Contents/MacOS/OpenUtau.dll"
+"$dotnet" run --project "$repo/tools/patch-phrase-timing" -c Release -- \
+    "$official_app/Contents/MacOS/OpenUtau.Core.dll" \
+    "$source_dir/OpenUtau.Core/bin/Release/net10.0/osx-arm64/OpenUtau.Core.dll" \
+    "$output_app/Contents/MacOS/OpenUtau.Core.dll"
 clang -dynamiclib -fobjc-arc -fblocks -framework AppKit -arch arm64 \
     ${OPENUTAU_PINCH_DEBUG:+-DOPENUTAU_PINCH_DEBUG} \
     "$repo/native/openutau_pinch_axis.m" \
