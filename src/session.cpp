@@ -20,15 +20,20 @@ bool Session::Start() {
     if (running_.load()) {
         return true;
     }
-    if (!listener_.Start()) {
 #if defined(__APPLE__)
-        // Logic's AUHostingService may allow outgoing loopback connections but deny listen().
-        // The local relay owns the advertised listener in that case.
-        relayMode_ = true;
+    // On macOS the relay is not a fallback for a host that denies listen(); it is the only
+    // arrangement that works. Logic runs Audio Units inside AUHostingServiceXPC, whose
+    // sandbox rewrites TMPDIR to a private `.../T/AUHostingService/` directory. A plugin
+    // that listens directly therefore publishes its advertisement where OpenUtau - which
+    // resolves the *user's* temp directory - can never see it. The relay runs as a login
+    // agent outside that sandbox, so it advertises where OpenUtau looks and forwards to
+    // the plugin. Listening directly here is not a faster path, it is an invisible one.
+    relayMode_ = true;
 #else
+    if (!listener_.Start()) {
         return false;
-#endif
     }
+#endif
     // Bound first, advertised second: OpenUtau reads an advertisement as a promise that the port
     // is already listening, and deletes any file whose port it can bind itself (§4). The display
     // name is left to the stem, since a host does not say which track a plugin is on until later.
