@@ -72,7 +72,7 @@ One JSON file per plugin instance:
 {
   "port": 52341,
   "name": "OpenUtau Bridge (Track 1)",
-  "apiVersion": "1.2"
+  "apiVersion": "1.3"
 }
 ```
 
@@ -126,7 +126,7 @@ audio <hash> <length>\n
 #### `init` (request)
 
 - `request:<uuid>:init`, payload `{ "ustx": "<full USTX project document>" }`
-- Response `data`: `{ "apiVersion": "1.2" }`
+- Response `data`: `{ "apiVersion": "1.3" }`
 - Sent once at connect; the full project is the baseline. OpenUtau is the sole owner of the project, so the baseline only ever travels outward and is never echoed back.
 
 #### `updateUstx` (notification)
@@ -211,9 +211,104 @@ audio 13507256038857166760 3528000\n<3528000 raw bytes>
 
 - The DAW project's tempo, sent when it changes. Without ARA there is no tempo-map sync (§1): OpenUtau uses this only as a guard — warning the user once per distinct mismatch, with a **±0.5 BPM** tolerance, that bars will misalign — never to retempo-map the project.
 
-### 6.3 MIDI input (reserved — not in v1)
+### 6.3 MIDI input — v1.3
 
-Reserved for a future message family (e.g. `notification:midiNotes`, `request:recordMidi`). The PR #2187 plugin received `MidiEvent*` in `run()` but never relayed it; v1 does not define this direction.
+The reverse direction: notes played or drawn in the DAW become notes in OpenUtau's
+project. This is **append-only** under §10 — a new message family in a new minor, not a
+change to anything in v1.0–1.2. Peers that negotiate below 1.3 never receive these kinds
+and are unaffected (§4.2 unknown-kind tolerance).
+
+#### Recording is explicit, never automatic
+
+The DAW pushes notes **only while a recording session is open**. There is no "always
+listen" mode. This is deliberate: a DAW re-sends the same notes on every playback, every
+cycle repeat and every locate, so a receiver that accepted notes continuously would
+accumulate duplicates faster than a user could clear them. Gating on an explicit session
+moves that decision to the user, who knows whether they are editing or just listening.
+
+#### `recordStart` (request) — OpenUtau → Plugin
+
+```json
+{ "trackNo": 0, "startMs": 0.0, "endMs": 16000.0 }
+```
+
+- Opens a recording session. `trackNo` is the OpenUtau track the notes belong to;
+  `startMs`/`endMs` are the target window on the shared timeline, so the plugin can
+  discard anything the DAW sends from outside it.
+- Response `data`: `{ "sessionId": "r-7", "apiVersion": "1.3" }`. `sessionId` is opaque
+  and must be echoed on every `midiNotes` for this session.
+- Opening a session while one is open is an error (`session_already_open`); the receiver
+  must send `recordStop` first.
+
+#### `midiNotes` (notification) — Plugin → OpenUtau
+
+```json
+{
+  "sessionId": "r-7",
+  "notes": [
+    { "tone": 60, "startMs": 1000.0, "durationMs": 500.0, "velocity": 100, "lyric": "la" },
+    { "tone": 64, "startMs": 1500.0, "durationMs": 500.0, "velocity": 88, "lyric": "la" }
+  ]
+}
+```
+
+- A batch of notes. Sending batches rather than one note per message keeps a chord from
+  costing a message per voice; the sender chooses the pacing and the receiver must
+  tolerate any batching, including one note per message.
+- `tone` is a MIDI note number (0–127); OpenUtau maps it to `UNote.tone` unchanged.
+- `startMs` is **absolute milliseconds on the shared timeline** — the same coordinate
+  `playhead`'s `positionMs` and `updatePartLayout`'s `startMs` use. `durationMs` is the
+  note's own length. The receiver converts both to ticks on its own time axis (§6.3.1).
+- `velocity` is 0–127 as the DAW sent it, or absent. OpenUtau applies it to the note's
+  velocity expression when the project defines one; absent means "leave the default".
+- `lyric` is optional. MIDI cannot carry lyrics, so a DAW-side editor has nothing to send
+  and the receiver substitutes its default placeholder (§6.3.2). A sender that has a lyric
+  (a DAW whose editor supports text entry, or a re-send of notes that already carry one)
+  may include it.
+- Notes may arrive in any order and may overlap in time. The receiver sorts by position
+  when applying.
+- A `midiNotes` for an unknown or closed `sessionId` is dropped with a warning, not a
+  protocol error: the session may have closed while the message was in flight.
+
+#### `recordStop` (request) — OpenUtau → Plugin
+
+```json
+{ "sessionId": "r-7", "commit": true }
+```
+
+- Closes the session. `commit` false discards whatever was recorded (the user cancelled).
+- Response `data`: `{ "noteCount": 12 }` — how many notes the plugin sent during the
+  session, so OpenUtau can reconcile against what it actually applied.
+- `recordStop` for an already-closed session is not an error; it returns
+  `{ "noteCount": 0 }`.
+
+#### 6.3.1 Timing, and the tempo caveat
+
+Positions travel in milliseconds because that is the one coordinate both sides already
+agree on — it is what `playhead` and `updatePartLayout` use. The receiver converts with
+its own time axis (`MsPosToTickPos`), exactly as it already does for a playhead update.
+
+**This does not fix tempo mismatch.** §1 lists bidirectional tempo-map sync as a non-goal:
+a DAW whose tempo differs from OpenUtau's will place notes at musically wrong ticks, and
+neither side compensates. The `bpm` guard (§6.1) already warns the user about this, once
+per distinct mismatch. Recording is not exempt from that warning — it is more exposed to
+it than playback is, because the resulting notes are committed to the project rather than
+merely played.
+
+#### 6.3.2 Lyrics
+
+A MIDI note has no lyric. Rather than leave the field empty (which would leave notes
+unsingable until the user edited each one), the receiver substitutes its own default
+placeholder lyric. The intended workflow is that the user draws the melody in the DAW,
+then fills in real lyrics in OpenUtau, where the editor is built for it.
+
+#### 6.3.3 Applying notes
+
+Notes are applied to the target track as an undoable edit, so a mistaken recording is one
+undo away. The receiver creates the notes in the part that covers the recorded window, or
+creates a part if none does. Applying a session's notes must not disturb notes that were
+already in the project, including on a re-record of the same window: a second session
+over the same range adds notes, it does not replace them.
 
 ---
 
@@ -256,6 +351,7 @@ disconnect (user)   → final update → "close" → teardown
 - **Unknown fields** ignored by receivers.
 - `apiVersion` in discovery file + `init` response; major mismatch refuses connection.
 - **1.1 → 1.2:** `updateTracks` gained optional per-track `singer`/`engine` informational fields; nothing else changed, and 1.1 plugins interoperate unchanged.
+- **1.2 → 1.3:** added the MIDI-input family (§6.3): `recordStart`, `midiNotes`, `recordStop`. Nothing in 1.0–1.2 changed; a 1.2 peer never receives these kinds, and a 1.3 receiver must tolerate a peer that never sends them.
 
 ## 11. Security & Trust Model
 
