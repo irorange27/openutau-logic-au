@@ -9,6 +9,7 @@
 
 #include <clap/clap.h>
 #include <clap/ext/gui.h>
+#include <clap/ext/note-ports.h>
 
 #include <algorithm>
 #include <cmath>
@@ -96,6 +97,34 @@ bool AudioPortsGet(const clap_plugin_t *, uint32_t index, bool isInput,
 
 const clap_plugin_audio_ports_t kAudioPorts = {AudioPortsCount, AudioPortsGet};
 
+// ----------------------------------------------------------------- note ports
+//
+// Declaring a note input port is what makes a host send MIDI here at all: clap-wrapper's
+// AUv2 `setupMIDIBusses` reads this extension to decide whether the Audio Unit accepts
+// MIDI, and without it Logic treats the plugin as not accepting notes and never calls
+// the MIDI path. Output is deliberately zero ports - this bridge consumes notes only.
+
+uint32_t NotePortsCount(const clap_plugin_t *, bool isInput) {
+    return isInput ? 1 : 0;
+}
+
+bool NotePortsGet(const clap_plugin_t *, uint32_t index, bool isInput,
+                  clap_note_port_info_t *info) {
+    if (!isInput || index != 0 || info == nullptr) {
+        return false;
+    }
+    info->id = 0;
+    std::snprintf(info->name, sizeof(info->name), "Notes");
+    // Accept MIDI 1.0 bytes. CLAP-note is listed as well so a host that can speak it
+    // natively (and clap-wrapper, which translates AU MIDI to whichever dialect we
+    // prefer) delivers full note data rather than requiring us to parse running status.
+    info->supported_dialects = CLAP_NOTE_DIALECT_CLAP | CLAP_NOTE_DIALECT_MIDI;
+    info->preferred_dialect = CLAP_NOTE_DIALECT_CLAP;
+    return true;
+}
+
+const clap_plugin_note_ports_t kNotePorts = {NotePortsCount, NotePortsGet};
+
 // ---------------------------------------------------------------------- params
 
 uint32_t ParamsCount(const clap_plugin_t *) {
@@ -152,6 +181,10 @@ bool ParamsTextToValue(const clap_plugin_t *, clap_id id, const char *text, doub
 
 /// Parameter changes are applied whole-block. Sub-block accuracy would mean rendering two
 /// tracks' audio into one buffer, which is not what changing this parameter means.
+///
+/// Note events are observed here purely as evidence for the MIDI-import direction (see
+/// Session::ObserveNote): this build does not yet forward them to OpenUtau, it only
+/// records that the host delivered them so the wiring can be verified from the log.
 void ApplyEvents(Bridge *self, const clap_input_events_t *in) {
     if (in == nullptr || in->size == nullptr || in->get == nullptr) {
         return;
@@ -159,8 +192,31 @@ void ApplyEvents(Bridge *self, const clap_input_events_t *in) {
     uint32_t count = in->size(in);
     for (uint32_t i = 0; i < count; i++) {
         const clap_event_header_t *header = in->get(in, i);
-        if (header == nullptr || header->space_id != CLAP_CORE_EVENT_SPACE_ID ||
-            header->type != CLAP_EVENT_PARAM_VALUE) {
+        if (header == nullptr || header->space_id != CLAP_CORE_EVENT_SPACE_ID) {
+            continue;
+        }
+
+        if (header->type == CLAP_EVENT_NOTE_ON || header->type == CLAP_EVENT_NOTE_OFF) {
+            const auto *event = reinterpret_cast<const clap_event_note_t *>(header);
+            self->session.ObserveNote(event->key, event->velocity,
+                                      header->type == CLAP_EVENT_NOTE_ON, header->time);
+            continue;
+        }
+
+        // Raw MIDI bytes, for a host that answers with the MIDI dialect instead of CLAP
+        // notes. Note on with velocity 0 is a note off, per the MIDI 1.0 convention.
+        if (header->type == CLAP_EVENT_MIDI) {
+            const auto *event = reinterpret_cast<const clap_event_midi_t *>(header);
+            const uint8_t status = event->data[0] & 0xf0U;
+            if (status == 0x90U || status == 0x80U) {
+                const bool on = status == 0x90U && event->data[2] != 0;
+                self->session.ObserveNote(event->data[1], static_cast<double>(event->data[2]) / 127.0,
+                                          on, header->time);
+            }
+            continue;
+        }
+
+        if (header->type != CLAP_EVENT_PARAM_VALUE) {
             continue;
         }
         const auto *event = reinterpret_cast<const clap_event_param_value_t *>(header);
@@ -450,6 +506,9 @@ clap_process_status PluginProcess(const clap_plugin_t *plugin, const clap_proces
 const void *PluginGetExtension(const clap_plugin_t *plugin, const char *id) {
     if (std::strcmp(id, CLAP_EXT_AUDIO_PORTS) == 0) {
         return &kAudioPorts;
+    }
+    if (std::strcmp(id, CLAP_EXT_NOTE_PORTS) == 0) {
+        return &kNotePorts;
     }
     if (std::strcmp(id, CLAP_EXT_PARAMS) == 0) {
         return &kParams;
