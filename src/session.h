@@ -149,6 +149,19 @@ public:
     void NoteTransport(bool hasPosition, double seconds, bool playing, bool hasTempo,
                        double tempo);
 
+    /// Audio thread. Records one note the host delivered. Lock-free by design: this runs in
+    /// process(), so it only bumps counters and stores the most recent note. The worker
+    /// drains them (DrainNotes) and does the logging, which locks.
+    ///
+    /// This build exists to prove the host actually reaches us with notes - the MIDI-import
+    /// direction (§6.3) is not wired to OpenUtau yet, so nothing here changes rendering.
+    void ObserveNote(int key, double velocity, bool on, uint32_t timeInBlock);
+
+    /// Worker thread. Reports anything ObserveNote saw since the last call, then clears it.
+    /// Returns the number of notes observed (0 when there were none), so the caller can tell
+    /// "no notes yet" from "notes, already logged".
+    int DrainNotes();
+
     /// Main thread. A consistent snapshot for the info window. The mutex is held only for
     /// the string members, briefly; this is never called from the audio thread.
     UiState UiCopy() const;
@@ -236,6 +249,22 @@ private:
     std::atomic<bool> hopeless_{false};
     /// Audio thread only, so the edge is detected where the transport is seen.
     bool wasPlaying_ = false;
+
+    // --- notes the host delivered, written on the audio thread, drained on the worker ---
+    /// A monotonic count of note events since the session started. The audio thread only ever
+    /// increments this; the worker reads it to decide whether anything is new, and keeps its
+    /// own record of how far it has reported.
+    std::atomic<uint64_t> noteCount_{0};
+    /// The most recent note, for a one-line report. Written by the audio thread as plain
+    /// stores in the order key, velocity, isOn, then the counter release-stores last: the
+    /// worker only trusts these fields once it has seen the matching counter value, so a torn
+    /// read across two notes is impossible in practice.
+    std::atomic<int> lastNoteKey_{0};
+    std::atomic<double> lastNoteVelocity_{0.0};
+    std::atomic<bool> lastNoteOn_{false};
+    std::atomic<uint32_t> lastNoteTime_{0};
+    /// Worker thread only: the note count as last reported.
+    uint64_t reportedNoteCount_ = 0;
 
     // --- worker thread only: what has already been reported upstream ---
     /// The playhead as last sent. `sentPlaying_` is initialised inverted so that a fresh

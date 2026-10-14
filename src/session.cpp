@@ -77,6 +77,8 @@ void Session::Run() {
         ServeConnection();
         PumpPlayhead();
         PumpTempo();
+        // Logging locks, so the audio thread only counts notes and this worker reports them.
+        DrainNotes();
         if (dirty_) {
             dirty_ = false;
             Republish();
@@ -330,6 +332,40 @@ void Session::NoteTransport(bool hasPosition, double seconds, bool playing, bool
         playbackStarted_.store(true);
     }
     wasPlaying_ = playing;
+}
+
+void Session::ObserveNote(int key, double velocity, bool on, uint32_t timeInBlock) {
+    // Fields first, counter last: the worker only reads them once it sees a count that
+    // includes this note, so a half-written note is never reported.
+    lastNoteKey_.store(key, std::memory_order_relaxed);
+    lastNoteVelocity_.store(velocity, std::memory_order_relaxed);
+    lastNoteOn_.store(on, std::memory_order_relaxed);
+    lastNoteTime_.store(timeInBlock, std::memory_order_relaxed);
+    noteCount_.fetch_add(1, std::memory_order_release);
+}
+
+int Session::DrainNotes() {
+    const uint64_t total = noteCount_.load(std::memory_order_acquire);
+    if (total == reportedNoteCount_) {
+        return 0;
+    }
+    const uint64_t fresh = total - reportedNoteCount_;
+    reportedNoteCount_ = total;
+
+    const int key = lastNoteKey_.load(std::memory_order_relaxed);
+    const double velocity = lastNoteVelocity_.load(std::memory_order_relaxed);
+    const bool on = lastNoteOn_.load(std::memory_order_relaxed);
+    const uint32_t time = lastNoteTime_.load(std::memory_order_relaxed);
+
+    // One line per drain rather than per note: a bar of chords would otherwise flood the
+    // host's log, and what this build needs to establish is only that notes arrive at all.
+    static const char *kNames[12] = {"C",  "C#", "D",  "D#", "E",  "F",
+                                     "F#", "G",  "G#", "A",  "A#", "B"};
+    const int octave = key / 12 - 1;
+    const char *name = (key >= 0 && key < 128) ? kNames[key % 12] : "?";
+    BRIDGE_INFO("note: %s %s%d vel=%.3f offset=%u (%llu since last report)", on ? "on " : "off",
+                name, octave, velocity, time, static_cast<unsigned long long>(fresh));
+    return static_cast<int>(fresh);
 }
 
 UiState Session::UiCopy() const {
