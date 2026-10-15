@@ -42,6 +42,13 @@ struct Options {
     uint32_t blockFrames = 512;
     double loopSeconds = 0.0;  // 0 plays forward forever.
     std::string directory;     // Empty means the production discovery directory.
+    /// Play a note pattern into the session, the way a DAW sends MIDI while recording (§6.3).
+    /// Zero means no notes, which is what every earlier run did.
+    int noteCount = 0;
+    /// Seconds between the starts of consecutive notes in that pattern.
+    double noteSpacingSeconds = 0.5;
+    /// How long each note is held.
+    double noteLengthSeconds = 0.25;
 };
 
 /// Returns false when the arguments do not make sense, having said why.
@@ -62,6 +69,12 @@ bool ParseOptions(int argc, char **argv, Options *options) {
             options->loopSeconds = std::atof(argv[++i]);
         } else if (flag == "--dir" && hasValue) {
             options->directory = argv[++i];
+        } else if (flag == "--notes" && hasValue) {
+            options->noteCount = std::atoi(argv[++i]);
+        } else if (flag == "--note-spacing" && hasValue) {
+            options->noteSpacingSeconds = std::atof(argv[++i]);
+        } else if (flag == "--note-length" && hasValue) {
+            options->noteLengthSeconds = std::atof(argv[++i]);
         } else {
             std::printf("Unrecognised argument: %s\n", flag.c_str());
             return false;
@@ -69,6 +82,10 @@ bool ParseOptions(int argc, char **argv, Options *options) {
     }
     if (options->sampleRate < 8000.0 || options->blockFrames == 0) {
         std::printf("A sample rate of at least 8000 and a non-zero block size are needed.\n");
+        return false;
+    }
+    if (options->noteCount < 0) {
+        std::printf("--notes cannot be negative.\n");
         return false;
     }
     return true;
@@ -81,6 +98,9 @@ void Usage() {
         "  --track <n>      the OpenUtau track to play, zero-based (default 0)\n"
         "  --block <n>      frames per block (default 512)\n"
         "  --loop <sec>     restart the transport every <sec> seconds (default: play forward)\n"
+        "  --notes <n>      send <n> ascending notes into the session (default 0, none)\n"
+        "  --note-spacing <sec>  seconds between note starts (default 0.5)\n"
+        "  --note-length <sec>   seconds each note is held (default 0.25)\n"
         "  --dir <path>     discovery directory (default: the one OpenUtau scans)\n");
 }
 
@@ -102,6 +122,9 @@ int main(int argc, char **argv) {
                                           ? bridge::DiscoveryDirectory()
                                           : std::filesystem::path(options.directory);
     bridge::Session session(std::move(directory));
+    // This runs outside a DAW, so there is no host sandbox rewriting TMPDIR and no relay to
+    // dial: listening directly is both possible and what makes the advertised port reachable.
+    session.ListenDirectly();
     session.SetHostSampleRate(options.sampleRate);
     session.SetTrackNo(options.trackNo);
     if (!session.Start()) {
@@ -127,6 +150,11 @@ int main(int argc, char **argv) {
     int64_t lastPosition = 0;
     float peakLeft = 0.0f;
     float peakRight = 0.0f;
+    // Which pass through the --notes pattern each note was last sent on, so a note goes out
+    // once per pass even though the transport position passes its start on every block. -1
+    // means "not yet", and the pattern's own pass number is what marks it done.
+    std::vector<long long> sentOn(static_cast<size_t>(std::max(0, options.noteCount)), -1);
+    std::vector<long long> sentOff(static_cast<size_t>(std::max(0, options.noteCount)), -1);
     while (!g_stop.load()) {
         int64_t position = loopFrames > 0 ? rendered % loopFrames : rendered;
         if (position < lastPosition) {
@@ -139,6 +167,41 @@ int main(int argc, char **argv) {
         // The position feeds the v1.1 playhead notifications as well as the renderer.
         session.NoteTransport(true, static_cast<double>(position) / options.sampleRate, true,
                               false, 0.0);
+
+        // §6.3: play a note pattern into the session, which is what a DAW does while the user
+        // records. Notes are delivered at their absolute timeline position, exactly as
+        // ApplyEvents would deliver a host's.
+        //
+        // The pattern repeats for as long as the process runs rather than being played once.
+        // A session opens whenever the other side asks, which in any real run is long after
+        // startup - a one-shot pattern would have finished before there was anyone to record it,
+        // and the recording would look empty for reasons that have nothing to do with the
+        // protocol. (It did, before this looped.)
+        if (options.noteCount > 0) {
+            const double nowMs = static_cast<double>(position) * 1000.0 / options.sampleRate;
+            const double spacingMs = options.noteSpacingSeconds * 1000.0;
+            const double lengthMs = options.noteLengthSeconds * 1000.0;
+            const double cycleMs = spacingMs * options.noteCount;
+            // Which pass through the pattern this block is in. Each pass sends every note again,
+            // so a receiver that listened continuously would see duplicates - which is the
+            // behaviour §6.3 exists to make the user opt into, and worth reproducing here.
+            const long long pass = static_cast<long long>(nowMs / cycleMs);
+            for (int n = 0; n < options.noteCount; n++) {
+                const double onMs = pass * cycleMs + n * spacingMs;
+                const double offMs = onMs + lengthMs;
+                // Ascending from middle C, so a batch is easy to eyeball at the far end.
+                const int key = 60 + (n % 12);
+                if (sentOn[n] != pass && nowMs >= onMs) {
+                    session.ObserveNote(key, 100, true, onMs);
+                    sentOn[n] = pass;
+                }
+                if (sentOff[n] != pass && nowMs >= offMs) {
+                    session.ObserveNote(key, 0, false, offMs);
+                    sentOff[n] = pass;
+                }
+            }
+        }
+
         lastPosition = position;
         session.Render(position, left.size(), left.data(), right.data());
         for (size_t i = 0; i < left.size(); i++) {

@@ -153,7 +153,7 @@ TEST_CASE("A session is found through its advertisement and plays what OpenUtau 
 
     Session session(dir.path);
 
-    session.UseDirectListenerForTest();
+    session.ListenDirectly();
     // The wire rate, so what comes out is what went in rather than a resampling of it.
     session.SetHostSampleRate(44100.0);
     session.SetTrackNo(0);
@@ -244,7 +244,7 @@ TEST_CASE("Retargeting the instance to another track changes what it plays") {
 
     Session session(dir.path);
 
-    session.UseDirectListenerForTest();
+    session.ListenDirectly();
     session.SetHostSampleRate(44100.0);
     REQUIRE(session.Start());
     FakeOpenUtau utau;
@@ -300,7 +300,7 @@ TEST_CASE("A host sample-rate change makes the session ask for every part again"
 
     Session session(dir.path);
 
-    session.UseDirectListenerForTest();
+    session.ListenDirectly();
     session.SetHostSampleRate(44100.0);
     REQUIRE(session.Start());
     FakeOpenUtau utau;
@@ -340,7 +340,7 @@ TEST_CASE("The transport is reported upstream and project info reaches the windo
     // updateProjectInfo snapshot the info window reads.
     TempDir dir;
     Session session(dir.path);
-    session.UseDirectListenerForTest();
+    session.ListenDirectly();
     session.SetHostSampleRate(44100.0);
     REQUIRE(session.Start());
     FakeOpenUtau utau;
@@ -415,7 +415,7 @@ TEST_CASE("A bounce waits for audio a playback would have rendered as silence") 
 
     Session session(dir.path);
 
-    session.UseDirectListenerForTest();
+    session.ListenDirectly();
     session.SetHostSampleRate(44100.0);
     REQUIRE(session.Start());
     FakeOpenUtau utau;
@@ -477,7 +477,7 @@ TEST_CASE("Track metadata and the picker's request path reach the window") {
     // exactly one pending request for the plugin to report to the host.
     TempDir dir;
     Session session(dir.path);
-    session.UseDirectListenerForTest();
+    session.ListenDirectly();
     session.SetHostSampleRate(44100.0);
     REQUIRE(session.Start());
     FakeOpenUtau utau;

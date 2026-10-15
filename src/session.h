@@ -72,13 +72,14 @@ public:
     explicit Session(std::filesystem::path discoveryDirectory)
         : discovery_(std::move(discoveryDirectory)) {}
 
-    /// Test seam: listen directly instead of going through the relay.
+    /// Listen on our own port and advertise it, instead of going through the relay.
     ///
-    /// On macOS the relay is the only arrangement that works inside a host (§Start), because
+    /// On macOS the relay is the only arrangement that works inside a host (see Start), because
     /// AUHostingServiceXPC rewrites TMPDIR so a direct advertisement lands where OpenUtau never
-    /// looks. A test is not inside that sandbox and has no relay to dial, so it opts out here
-    /// and connects to the port the session advertises.
-    void UseDirectListenerForTest() { directListenerForTest_ = true; }
+    /// looks. Callers that are not inside that sandbox - the test suite, and bridge-host, which
+    /// runs the session outside a DAW on purpose - opt out here and let OpenUtau dial the
+    /// advertised port directly.
+    void ListenDirectly() { directListenerForTest_ = true; }
 
     ~Session() override;
 
@@ -229,7 +230,7 @@ private:
     std::unique_ptr<Connection> connection_;
 #if defined(__APPLE__)
     bool relayMode_ = false;
-    /// Set only by UseDirectListenerForTest.
+    /// Set only by ListenDirectly.
     bool directListenerForTest_ = false;
     std::unique_ptr<SocketStream> relayPending_;
     int64_t nextRelayAttemptMs_ = 0;
