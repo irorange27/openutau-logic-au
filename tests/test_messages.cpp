@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+using bridge::kApiVersion;
 using bridge::BuildDiscoveryJson;
 using bridge::BuildBpmPayload;
 using bridge::BuildFailEnvelope;
@@ -126,7 +127,9 @@ TEST_CASE("envelopes report success and carry their data") {
     REQUIRE(ParseEnvelope(initResponse, &envelope));
     CHECK(envelope.success);
     CHECK(envelope.error.empty());
-    CHECK(Contains(initResponse, "\"apiVersion\":\"1.2\""));
+    // Against the constant, not a literal: the version moves with the protocol and a
+    // test that hardcodes it turns every bump into a mystery failure.
+    CHECK(Contains(initResponse, std::string("\"apiVersion\":\"") + kApiVersion + "\""));
 
     std::string layoutResponse = BuildPartLayoutResponseEnvelope({"7", "8"});
     REQUIRE(ParseEnvelope(layoutResponse, &envelope));
@@ -161,7 +164,7 @@ TEST_CASE("the discovery file advertises port, name and version") {
     std::string json = BuildDiscoveryJson(52341, "OpenUtau Bridge (Track 1)");
     CHECK(Contains(json, "\"port\":52341"));
     CHECK(Contains(json, "\"name\":\"OpenUtau Bridge (Track 1)\""));
-    CHECK(Contains(json, "\"apiVersion\":\"1.2\""));
+    CHECK(Contains(json, std::string("\"apiVersion\":\"") + kApiVersion + "\""));
 }
 
 TEST_CASE("project info parses its name and saved state") {

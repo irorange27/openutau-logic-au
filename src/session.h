@@ -72,6 +72,14 @@ public:
     explicit Session(std::filesystem::path discoveryDirectory)
         : discovery_(std::move(discoveryDirectory)) {}
 
+    /// Test seam: listen directly instead of going through the relay.
+    ///
+    /// On macOS the relay is the only arrangement that works inside a host (§Start), because
+    /// AUHostingServiceXPC rewrites TMPDIR so a direct advertisement lands where OpenUtau never
+    /// looks. A test is not inside that sandbox and has no relay to dial, so it opts out here
+    /// and connects to the port the session advertises.
+    void UseDirectListenerForTest() { directListenerForTest_ = true; }
+
     ~Session() override;
 
     Session(const Session &) = delete;
@@ -149,17 +157,18 @@ public:
     void NoteTransport(bool hasPosition, double seconds, bool playing, bool hasTempo,
                        double tempo);
 
-    /// Audio thread. Records one note the host delivered. Lock-free by design: this runs in
-    /// process(), so it only bumps counters and stores the most recent note. The worker
-    /// drains them (DrainNotes) and does the logging, which locks.
+    /// Audio thread. Records one note the host delivered, at its absolute position on the
+    /// shared timeline (§6.3). Lock-free and allocation-free by design: this runs in
+    /// process(), so it only touches a fixed-size ring. The worker drains it (DrainNotes) and
+    /// does the sending, which locks.
     ///
-    /// This build exists to prove the host actually reaches us with notes - the MIDI-import
-    /// direction (§6.3) is not wired to OpenUtau yet, so nothing here changes rendering.
-    void ObserveNote(int key, double velocity, bool on, uint32_t timeInBlock);
+    /// `atMs` is the note's absolute position — block start plus its sample offset — because
+    /// that is the coordinate OpenUtau's timeline uses (§6.3.1).
+    void ObserveNote(int key, int velocity, bool on, double atMs);
 
-    /// Worker thread. Reports anything ObserveNote saw since the last call, then clears it.
-    /// Returns the number of notes observed (0 when there were none), so the caller can tell
-    /// "no notes yet" from "notes, already logged".
+    /// Worker thread. Moves what ObserveNote captured into the open session, dropping notes
+    /// outside the session's window, and sends it as one `midiNotes` batch. Returns the number
+    /// of notes taken off the ring.
     int DrainNotes();
 
     /// Main thread. A consistent snapshot for the info window. The mutex is held only for
@@ -187,6 +196,14 @@ private:
     void ServeConnection();
     void Republish();
 
+    /// Worker thread. Appends one completed note to the open session, enforcing the cap.
+    void AppendCapturedNote(int key, double startMs, double durationMs, int velocity);
+
+    /// A session is one musical take; more than this in a window means something is wrong
+    /// (a runaway retrigger, or a window the user did not mean), and the cap keeps a stuck
+    /// host from growing the batch without bound.
+    static constexpr size_t kMaxSessionNotes = 4096;
+
     /// Audio thread, offline only. Sleeps until the worker has everything or until waiting stops
     /// being worthwhile. False when it gave up, and then the block renders with what is there.
     bool WaitForSync();
@@ -197,6 +214,8 @@ private:
     void OnTracks(const std::vector<TrackInfo> &tracks) override;
     void OnProjectInfo(const ProjectInfo &info) override;
     void OnAudio(const std::string &hash, std::vector<uint8_t> &&pcm) override;
+    std::string OnRecordStart(const RecordStartRequest &request) override;
+    int OnRecordStop(const RecordStopRequest &request) override;
 
     Listener listener_;
     Discovery discovery_;
@@ -210,6 +229,8 @@ private:
     std::unique_ptr<Connection> connection_;
 #if defined(__APPLE__)
     bool relayMode_ = false;
+    /// Set only by UseDirectListenerForTest.
+    bool directListenerForTest_ = false;
     std::unique_ptr<SocketStream> relayPending_;
     int64_t nextRelayAttemptMs_ = 0;
 #endif
@@ -251,20 +272,50 @@ private:
     bool wasPlaying_ = false;
 
     // --- notes the host delivered, written on the audio thread, drained on the worker ---
-    /// A monotonic count of note events since the session started. The audio thread only ever
-    /// increments this; the worker reads it to decide whether anything is new, and keeps its
-    /// own record of how far it has reported.
-    std::atomic<uint64_t> noteCount_{0};
-    /// The most recent note, for a one-line report. Written by the audio thread as plain
-    /// stores in the order key, velocity, isOn, then the counter release-stores last: the
-    /// worker only trusts these fields once it has seen the matching counter value, so a torn
-    /// read across two notes is impossible in practice.
-    std::atomic<int> lastNoteKey_{0};
-    std::atomic<double> lastNoteVelocity_{0.0};
-    std::atomic<bool> lastNoteOn_{false};
-    std::atomic<uint32_t> lastNoteTime_{0};
-    /// Worker thread only: the note count as last reported.
-    uint64_t reportedNoteCount_ = 0;
+
+    /// One captured note. Plain data so the ring holds no allocations.
+    struct CapturedNote {
+        int key = 0;
+        int velocity = 0;
+        bool on = false;
+        double atMs = 0.0;
+    };
+
+    /// How many note events the ring holds before the audio thread starts dropping. A bar of
+    /// dense chords is a few dozen events; the worker drains every poll (50 ms), so this is
+    /// far more than one poll can produce. A host that stops being drained loses its oldest
+    /// notes rather than blocking the audio thread — dropping notes is recoverable, a stalled
+    /// audio thread is not.
+    static constexpr size_t kNoteRingSize = 1024;
+    /// Producer index, incremented only by the audio thread.
+    std::atomic<uint64_t> noteWrite_{0};
+    /// Consumer index, advanced only by the worker.
+    uint64_t noteRead_ = 0;
+    /// Dropped because the ring was full, so the loss is visible rather than silent.
+    std::atomic<uint64_t> notesDropped_{0};
+    CapturedNote noteRing_[kNoteRingSize] = {};
+
+    // --- the recording session (§6.3), worker thread only ---
+    /// Whether a session is open. Read by the audio thread to decide whether a note is worth
+    /// capturing at all, so it is atomic; everything else about the session stays on the worker.
+    std::atomic<bool> recording_{false};
+    std::string sessionId_;
+    int sessionTrackNo_ = 0;
+    double sessionStartMs_ = 0.0;
+    double sessionEndMs_ = 0.0;
+    /// Notes captured for the open session, in arrival order.
+    std::vector<DawNote> sessionNotes_;
+    /// A note-on with no matching note-off yet, so the duration is known only when the off
+    /// arrives. Keyed by pitch; a retrigger closes the previous one rather than losing it.
+    struct OpenNote {
+        int key = 0;
+        double startMs = 0.0;
+        int velocity = 0;
+        bool held = false;
+    };
+    OpenNote openNotes_[128];
+    /// Sessions are numbered, not random: the id only has to be unique within one connection.
+    int sessionCounter_ = 0;
 
     // --- worker thread only: what has already been reported upstream ---
     /// The playhead as last sent. `sentPlaying_` is initialised inverted so that a fresh

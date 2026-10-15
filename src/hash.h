@@ -6,10 +6,6 @@
 
 namespace bridge {
 
-/// The protocol version this build speaks, carried by the discovery file and echoed in the
-/// init response (PROTOCOL.md §4).
-inline constexpr const char *kApiVersion = "1.2";
-
 /// Hard engine limits of OpenUtau's mixer; never negotiated (PROTOCOL.md §1).
 inline constexpr int kWireSampleRate = 44100;
 inline constexpr int kWireChannels = 2;

@@ -28,7 +28,15 @@ bool Session::Start() {
     // resolves the *user's* temp directory - can never see it. The relay runs as a login
     // agent outside that sandbox, so it advertises where OpenUtau looks and forwards to
     // the plugin. Listening directly here is not a faster path, it is an invisible one.
-    relayMode_ = true;
+    //
+    // A test is not inside that sandbox and has no relay to dial, so it listens directly.
+    if (directListenerForTest_) {
+        if (!listener_.Start()) {
+            return false;
+        }
+    } else {
+        relayMode_ = true;
+    }
 #else
     if (!listener_.Start()) {
         return false;
@@ -334,38 +342,157 @@ void Session::NoteTransport(bool hasPosition, double seconds, bool playing, bool
     wasPlaying_ = playing;
 }
 
-void Session::ObserveNote(int key, double velocity, bool on, uint32_t timeInBlock) {
-    // Fields first, counter last: the worker only reads them once it sees a count that
-    // includes this note, so a half-written note is never reported.
-    lastNoteKey_.store(key, std::memory_order_relaxed);
-    lastNoteVelocity_.store(velocity, std::memory_order_relaxed);
-    lastNoteOn_.store(on, std::memory_order_relaxed);
-    lastNoteTime_.store(timeInBlock, std::memory_order_relaxed);
-    noteCount_.fetch_add(1, std::memory_order_release);
+void Session::ObserveNote(int key, int velocity, bool on, double atMs) {
+    // Nothing is captured unless a session is open. A host re-sends the same notes on every
+    // playback, cycle repeat and locate, so recording continuously would accumulate
+    // duplicates faster than a user could clear them (§6.3).
+    if (!recording_.load(std::memory_order_relaxed)) {
+        return;
+    }
+    if (key < 0 || key > 127) {
+        return;
+    }
+    const uint64_t write = noteWrite_.load(std::memory_order_relaxed);
+    if (write - noteRead_ >= kNoteRingSize) {
+        // The worker is behind. Losing the oldest note is better than blocking process().
+        notesDropped_.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    CapturedNote &slot = noteRing_[write % kNoteRingSize];
+    slot.key = key;
+    slot.velocity = velocity;
+    slot.on = on;
+    slot.atMs = atMs;
+    // Release, so a worker that sees this index also sees the fields above it.
+    noteWrite_.store(write + 1, std::memory_order_release);
 }
 
 int Session::DrainNotes() {
-    const uint64_t total = noteCount_.load(std::memory_order_acquire);
-    if (total == reportedNoteCount_) {
+    const uint64_t write = noteWrite_.load(std::memory_order_acquire);
+    if (write == noteRead_) {
         return 0;
     }
-    const uint64_t fresh = total - reportedNoteCount_;
-    reportedNoteCount_ = total;
+    int taken = 0;
+    while (noteRead_ != write) {
+        const CapturedNote &slot = noteRing_[noteRead_ % kNoteRingSize];
+        const int key = slot.key;
+        const int velocity = slot.velocity;
+        const bool on = slot.on;
+        const double atMs = slot.atMs;
+        ++noteRead_;
+        ++taken;
+        if (!recording_.load(std::memory_order_relaxed)) {
+            continue;
+        }
+        // Notes outside the window the session asked for are dropped here as well as on the
+        // receiving side: a note the user did not record should not be trusted to a peer.
+        if (atMs < sessionStartMs_ || atMs >= sessionEndMs_) {
+            continue;
+        }
+        if (on) {
+            // A retrigger of a pitch that is still held closes the previous note rather than
+            // discarding it, so a fast repeat is not silently collapsed into one note.
+            OpenNote &existing = openNotes_[key];
+            if (existing.held) {
+                AppendCapturedNote(existing.key, existing.startMs, atMs - existing.startMs,
+                                   existing.velocity);
+            }
+            existing.key = key;
+            existing.startMs = atMs;
+            existing.velocity = velocity;
+            existing.held = true;
+        } else {
+            OpenNote &existing = openNotes_[key];
+            if (existing.held) {
+                AppendCapturedNote(existing.key, existing.startMs, atMs - existing.startMs,
+                                   existing.velocity);
+                existing.held = false;
+            }
+        }
+    }
+    const uint64_t dropped = notesDropped_.exchange(0, std::memory_order_relaxed);
+    if (dropped > 0) {
+        BRIDGE_WARN("Dropped %llu note events: the worker did not drain the ring in time.",
+                    static_cast<unsigned long long>(dropped));
+    }
+    return taken;
+}
 
-    const int key = lastNoteKey_.load(std::memory_order_relaxed);
-    const double velocity = lastNoteVelocity_.load(std::memory_order_relaxed);
-    const bool on = lastNoteOn_.load(std::memory_order_relaxed);
-    const uint32_t time = lastNoteTime_.load(std::memory_order_relaxed);
+void Session::AppendCapturedNote(int key, double startMs, double durationMs, int velocity) {
+    if (sessionNotes_.size() >= kMaxSessionNotes) {
+        return;
+    }
+    DawNote note;
+    note.tone = key;
+    note.startMs = startMs;
+    note.durationMs = durationMs < 0.0 ? 0.0 : durationMs;
+    note.velocity = velocity;
+    sessionNotes_.push_back(note);
+}
 
-    // One line per drain rather than per note: a bar of chords would otherwise flood the
-    // host's log, and what this build needs to establish is only that notes arrive at all.
-    static const char *kNames[12] = {"C",  "C#", "D",  "D#", "E",  "F",
-                                     "F#", "G",  "G#", "A",  "A#", "B"};
-    const int octave = key / 12 - 1;
-    const char *name = (key >= 0 && key < 128) ? kNames[key % 12] : "?";
-    BRIDGE_INFO("note: %s %s%d vel=%.3f offset=%u (%llu since last report)", on ? "on " : "off",
-                name, octave, velocity, time, static_cast<unsigned long long>(fresh));
-    return static_cast<int>(fresh);
+std::string Session::OnRecordStart(const RecordStartRequest &request) {
+    if (recording_.load()) {
+        return std::string();
+    }
+    // A session opened mid-phrase would otherwise inherit note-ons from before it: a key held
+    // down when the user pressed record has no note-off inside the window and would never be
+    // closed. Starting from a clean slate makes every note in the window self-contained.
+    for (auto &open : openNotes_) {
+        open.held = false;
+    }
+    sessionNotes_.clear();
+    sessionTrackNo_ = request.trackNo;
+    sessionStartMs_ = request.startMs;
+    sessionEndMs_ = request.endMs;
+    sessionId_ = "r-" + std::to_string(++sessionCounter_);
+    // Last: the audio thread starts capturing as soon as this is set.
+    recording_.store(true, std::memory_order_release);
+    BRIDGE_INFO("Recording session %s open: track %d, [%.1f, %.1f) ms.", sessionId_.c_str(),
+                sessionTrackNo_, sessionStartMs_, sessionEndMs_);
+    return sessionId_;
+}
+
+int Session::OnRecordStop(const RecordStopRequest &request) {
+    // Only the matching session may close this one. A stale stop from a previous session must
+    // not tear down a session that has since opened.
+    if (!recording_.load() || request.sessionId != sessionId_) {
+        return 0;
+    }
+    // Stop capturing first, then drain: whatever the audio thread captured before this point
+    // is still in the ring and belongs to the session.
+    recording_.store(false, std::memory_order_release);
+    DrainNotes();
+
+    int sent = 0;
+    if (request.commit) {
+        // Any note still held has no note-off in the window, so its duration is unknown. It is
+        // closed at the window's end rather than dropped: the user played it, and losing the
+        // last note of a take is worse than a duration that runs to the edge of the window.
+        for (auto &open : openNotes_) {
+            if (open.held) {
+                AppendCapturedNote(open.key, open.startMs,
+                                   std::max(0.0, sessionEndMs_ - open.startMs), open.velocity);
+                open.held = false;
+            }
+        }
+        if (!sessionNotes_.empty()) {
+            if (connection_ != nullptr &&
+                connection_->SendNotification(kind::kMidiNotes,
+                                              BuildMidiNotesPayload(sessionId_, sessionNotes_))) {
+                sent = static_cast<int>(sessionNotes_.size());
+            } else {
+                // The peer is gone or the write failed. The notes are not resent: the session
+                // is over, and the response below tells OpenUtau what it did not receive.
+                BRIDGE_WARN("Could not send %zu recorded notes; the connection is not usable.",
+                            sessionNotes_.size());
+            }
+        }
+    }
+    BRIDGE_INFO("Recording session %s closed: %zu captured, %d sent, commit=%s.",
+                sessionId_.c_str(), sessionNotes_.size(), sent, request.commit ? "true" : "false");
+    sessionNotes_.clear();
+    sessionId_.clear();
+    return sent;
 }
 
 UiState Session::UiCopy() const {

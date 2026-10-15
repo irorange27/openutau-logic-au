@@ -39,6 +39,20 @@ public:
 
     /// A payload that has already passed its hash and frame-size checks.
     virtual void OnAudio(const std::string &hash, std::vector<uint8_t> &&pcm) = 0;
+
+    /// A `recordStart` request (v1.3, §6.3). Returns the session id to report, or an empty
+    /// string when a session is already open — the caller turns that into a failed envelope
+    /// rather than pretending a session exists.
+    ///
+    /// Defaults to refusing: recording is optional (§10), and a handler that has not
+    /// implemented it should answer "not supported" rather than silently accept notes it will
+    /// never send.
+    virtual std::string OnRecordStart(const RecordStartRequest &) { return std::string(); }
+
+    /// A `recordStop` request (v1.3, §6.3). Returns how many notes were sent. The caller sends
+    /// the response only after this returns, which is what makes the round-trip the point at
+    /// which the peer knows every recorded note has arrived.
+    virtual int OnRecordStop(const RecordStopRequest &) { return 0; }
 };
 
 enum class ConnectionEnd {

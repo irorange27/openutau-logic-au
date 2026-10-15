@@ -124,6 +124,42 @@ bool ParseProjectInfoNotification(const std::string &json, ProjectInfo *info) {
     return true;
 }
 
+bool ParseRecordStartRequest(const std::string &json, RecordStartRequest *request) {
+    Json object = ParseObject(json);
+    if (object.is_null()) {
+        return false;
+    }
+    // A window is the one thing this message exists to carry: without it the plugin cannot
+    // tell a note the user recorded from one the transport happened to be passing over.
+    auto start = object.find("startMs");
+    auto end = object.find("endMs");
+    if (start == object.end() || !start->is_number() || end == object.end() || !end->is_number()) {
+        return false;
+    }
+    request->trackNo = ReadInt(object, "trackNo", 0);
+    request->startMs = start->get<double>();
+    request->endMs = end->get<double>();
+    return true;
+}
+
+bool ParseRecordStopRequest(const std::string &json, RecordStopRequest *request) {
+    Json object = ParseObject(json);
+    if (object.is_null()) {
+        return false;
+    }
+    // The session id is the correlation key: without it a stop cannot be matched to the
+    // notes that belong to it, so a payload missing it is not a stop we can honour.
+    auto session = object.find("sessionId");
+    if (session == object.end() || !session->is_string()) {
+        return false;
+    }
+    request->sessionId = session->get<std::string>();
+    // Absent commit means commit: a peer that does not know the field is asking us to finish
+    // normally, and discarding its notes would be the surprising reading.
+    request->commit = ReadBool(object, "commit", true);
+    return true;
+}
+
 bool ParseEnvelope(const std::string &json, Envelope *envelope) {
     Json object = ParseObject(json);
     if (object.is_null()) {
@@ -163,6 +199,46 @@ std::string BuildFailEnvelope(const std::string &error) {
         {"error", error},
     };
     return envelope.dump();
+}
+
+std::string BuildRecordStartResponseEnvelope(const std::string &sessionId) {
+    Json envelope = {
+        {"success", true},
+        {"data", {{"sessionId", sessionId}, {"apiVersion", kApiVersion}}},
+        {"error", nullptr},
+    };
+    return envelope.dump();
+}
+
+std::string BuildRecordStopResponseEnvelope(int noteCount) {
+    Json envelope = {
+        {"success", true},
+        {"data", {{"noteCount", noteCount}}},
+        {"error", nullptr},
+    };
+    return envelope.dump();
+}
+
+std::string BuildMidiNotesPayload(const std::string &sessionId, const std::vector<DawNote> &notes) {
+    Json array = Json::array();
+    for (const auto &note : notes) {
+        Json entry = {
+            {"tone", note.tone},
+            {"startMs", note.startMs},
+            {"durationMs", note.durationMs},
+        };
+        // Omitted rather than sent as a sentinel: §6.3 makes the field optional, and a
+        // receiver that does not know it must leave its own default alone (§10).
+        if (note.velocity >= 0) {
+            entry["velocity"] = note.velocity;
+        }
+        array.push_back(std::move(entry));
+    }
+    Json payload = {
+        {"sessionId", sessionId},
+        {"notes", std::move(array)},
+    };
+    return payload.dump();
 }
 
 std::string BuildGetAudioPayload(const std::string &hash) {

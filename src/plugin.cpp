@@ -182,13 +182,22 @@ bool ParamsTextToValue(const clap_plugin_t *, clap_id id, const char *text, doub
 /// Parameter changes are applied whole-block. Sub-block accuracy would mean rendering two
 /// tracks' audio into one buffer, which is not what changing this parameter means.
 ///
-/// Note events are observed here purely as evidence for the MIDI-import direction (see
-/// Session::ObserveNote): this build does not yet forward them to OpenUtau, it only
-/// records that the host delivered them so the wiring can be verified from the log.
-void ApplyEvents(Bridge *self, const clap_input_events_t *in) {
+/// Note events are captured for the recording direction (§6.3) at their absolute position on
+/// the shared timeline: the block's start position plus the event's sample offset, which is
+/// the coordinate OpenUtau's own timeline uses.
+void ApplyEvents(Bridge *self, const clap_input_events_t *in, const clap_process_t *process) {
     if (in == nullptr || in->size == nullptr || in->get == nullptr) {
         return;
     }
+    // Positions are carried in milliseconds because that is the coordinate the protocol and
+    // OpenUtau's timeline share; the conversion to ticks happens on the far side, against the
+    // project's own time axis (§6.3.1). A null process means no position is available.
+    double blockStartMs = 0.0;
+    const bool hasBlockStart =
+        process != nullptr && bridge::BlockSeconds(process->transport, &blockStartMs);
+    blockStartMs *= 1000.0;
+    const double msPerFrame = self->sampleRate > 0.0 ? 1000.0 / self->sampleRate : 0.0;
+
     uint32_t count = in->size(in);
     for (uint32_t i = 0; i < count; i++) {
         const clap_event_header_t *header = in->get(in, i);
@@ -198,8 +207,14 @@ void ApplyEvents(Bridge *self, const clap_input_events_t *in) {
 
         if (header->type == CLAP_EVENT_NOTE_ON || header->type == CLAP_EVENT_NOTE_OFF) {
             const auto *event = reinterpret_cast<const clap_event_note_t *>(header);
-            self->session.ObserveNote(event->key, event->velocity,
-                                      header->type == CLAP_EVENT_NOTE_ON, header->time);
+            // Without a transport position there is nowhere to put the note, and a note at an
+            // invented position is worse than no note.
+            if (hasBlockStart) {
+                self->session.ObserveNote(event->key,
+                                          static_cast<int>(std::lround(event->velocity * 127.0)),
+                                          header->type == CLAP_EVENT_NOTE_ON,
+                                          blockStartMs + header->time * msPerFrame);
+            }
             continue;
         }
 
@@ -209,9 +224,11 @@ void ApplyEvents(Bridge *self, const clap_input_events_t *in) {
             const auto *event = reinterpret_cast<const clap_event_midi_t *>(header);
             const uint8_t status = event->data[0] & 0xf0U;
             if (status == 0x90U || status == 0x80U) {
-                const bool on = status == 0x90U && event->data[2] != 0;
-                self->session.ObserveNote(event->data[1], static_cast<double>(event->data[2]) / 127.0,
-                                          on, header->time);
+                if (hasBlockStart) {
+                    const bool on = status == 0x90U && event->data[2] != 0;
+                    self->session.ObserveNote(event->data[1], event->data[2], on,
+                                              blockStartMs + header->time * msPerFrame);
+                }
             }
             continue;
         }
@@ -313,7 +330,11 @@ void NotifyTrackRequest(Bridge *self, const clap_output_events_t *out) {
 void ParamsFlush(const clap_plugin_t *plugin, const clap_input_events_t *in,
                  const clap_output_events_t *out) {
     Bridge *self = Bridge::Of(plugin);
-    ApplyEvents(self, in);
+    // A null process means "no transport position available": parameter changes still apply,
+    // notes are not captured. Flush runs outside a process block, so there is no block start to
+    // position a note against and anything captured here would land at an invented time
+    // (§6.3.1). Hosts deliver notes through process() in any case.
+    ApplyEvents(self, in, nullptr);
     NotifyTrackRequest(self, out);
 }
 
@@ -471,7 +492,7 @@ void ClearOutput(const clap_audio_buffer_t &out, uint32_t frames) {
 
 clap_process_status PluginProcess(const clap_plugin_t *plugin, const clap_process_t *process) {
     Bridge *self = Bridge::Of(plugin);
-    ApplyEvents(self, process->in_events);
+    ApplyEvents(self, process->in_events, process);
     NotifyTrackRequest(self, process->out_events);
 
     if (process->audio_outputs_count == 0 || process->audio_outputs[0].data32 == nullptr ||
